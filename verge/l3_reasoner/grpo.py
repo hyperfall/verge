@@ -130,6 +130,9 @@ class GRPOEngine:
             return correct / len(frozen_test)
 
         model = AutoModelForCausalLM.from_pretrained(s.base_model)
+        if torch.cuda.is_available():
+            model = model.to("cuda")  # else baseline measure() runs on CPU (TRL only
+            #                            moves the model to GPU later, inside .train())
         curve = [measure(model)]  # round 0 baseline, before any GRPO
 
         for _r in range(1, rounds + 1):
