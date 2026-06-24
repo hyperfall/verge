@@ -120,22 +120,29 @@ class GRPOEngine:
 
         def measure(model) -> float:
             model.eval()
+            n = len(frozen_test)
+            every = max(1, n // 4)  # ~4 progress lines over the (otherwise silent) eval
             correct = 0
-            for p in frozen_test:
+            for i, p in enumerate(frozen_test, 1):
                 enc = tok(_build_prompt(tok, p), return_tensors="pt").to(model.device)
                 out = model.generate(**enc, max_new_tokens=s.max_completion_length,
                                      do_sample=False, pad_token_id=tok.pad_token_id)
                 text = tok.decode(out[0, enc["input_ids"].shape[1]:], skip_special_tokens=True)
                 correct += int(verify(Problem(p.id, p.prompt, p.answer), text))
-            return correct / len(frozen_test)
+                if i % every == 0 or i == n:
+                    print(f"  [eval] {i}/{n}  running acc={correct / i:.3f}", flush=True)
+            return correct / n
 
         model = AutoModelForCausalLM.from_pretrained(s.base_model)
         if torch.cuda.is_available():
             model = model.to("cuda")  # else baseline measure() runs on CPU (TRL only
             #                            moves the model to GPU later, inside .train())
+        print(f"[seed {seed}] round 0/{rounds} — baseline eval", flush=True)
         curve = [measure(model)]  # round 0 baseline, before any GRPO
 
         for _r in range(1, rounds + 1):
+            print(f"[seed {seed}] round {_r}/{rounds} — GRPO {s.steps_per_round} steps",
+                  flush=True)
             cfg = GRPOConfig(output_dir=f"runs/grpo_seed{seed}", seed=seed,
                              max_steps=s.steps_per_round, logging_steps=10,
                              save_strategy="no", report_to=[], **s.to_trl_kwargs())
@@ -143,6 +150,7 @@ class GRPOEngine:
                                   args=cfg, train_dataset=ds, processing_class=tok)
             trainer.train()
             model = trainer.model
+            print(f"[seed {seed}] round {_r}/{rounds} — post-train eval", flush=True)
             curve.append(measure(model))
         return curve
 
