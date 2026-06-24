@@ -49,6 +49,7 @@ class GRPOSettings:
     # generation backend + schedule
     use_vllm: bool = True            # the throughput lever (verge[infer])
     per_device_train_batch_size: int = 8
+    eval_batch_size: int = 32        # frozen-test eval batched (was 1-at-a-time)
     steps_per_round: int = 100       # GRPO steps between frozen-test measurements
     eval_rounds: int = 4
 
@@ -100,6 +101,7 @@ class GRPOEngine:
 
     def run_seed(self, seed: int, *, rounds: int, frozen_test) -> list[float]:
         # All heavy imports are lazy so this module is import-clean on CPU.
+        import contextlib
         import torch  # noqa: F401
         from datasets import Dataset
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -118,19 +120,37 @@ class GRPOEngine:
 
         ds = Dataset.from_list([to_row(p) for p in self.train])
 
+        on_cuda = torch.cuda.is_available()
+
+        def _autocast():
+            # bf16 autocast for ~2x faster generation; weights stay fp32 (no accuracy hit).
+            return torch.autocast("cuda", dtype=torch.bfloat16) if on_cuda \
+                else contextlib.nullcontext()
+
+        @torch.no_grad()
         def measure(model) -> float:
             model.eval()
             n = len(frozen_test)
-            every = max(1, n // 4)  # ~4 progress lines over the (otherwise silent) eval
+            bs = s.eval_batch_size
+            # left-pad so decoder-only generation lines up across a padded batch
+            prev_side, tok.padding_side = tok.padding_side, "left"
             correct = 0
-            for i, p in enumerate(frozen_test, 1):
-                enc = tok(_build_prompt(tok, p), return_tensors="pt").to(model.device)
-                out = model.generate(**enc, max_new_tokens=s.max_completion_length,
-                                     do_sample=False, pad_token_id=tok.pad_token_id)
-                text = tok.decode(out[0, enc["input_ids"].shape[1]:], skip_special_tokens=True)
-                correct += int(verify(Problem(p.id, p.prompt, p.answer), text))
-                if i % every == 0 or i == n:
-                    print(f"  [eval] {i}/{n}  running acc={correct / i:.3f}", flush=True)
+            try:
+                for start in range(0, n, bs):
+                    batch = frozen_test[start:start + bs]
+                    prompts = [_build_prompt(tok, p) for p in batch]
+                    enc = tok(prompts, return_tensors="pt", padding=True).to(model.device)
+                    with _autocast():
+                        out = model.generate(**enc, max_new_tokens=s.max_completion_length,
+                                             do_sample=False, pad_token_id=tok.pad_token_id)
+                    gen = out[:, enc["input_ids"].shape[1]:]
+                    for p, g in zip(batch, gen):
+                        text = tok.decode(g, skip_special_tokens=True)
+                        correct += int(verify(Problem(p.id, p.prompt, p.answer), text))
+                    done = min(start + bs, n)
+                    print(f"  [eval] {done}/{n}  running acc={correct / done:.3f}", flush=True)
+            finally:
+                tok.padding_side = prev_side
             return correct / n
 
         model = AutoModelForCausalLM.from_pretrained(s.base_model)
@@ -145,7 +165,8 @@ class GRPOEngine:
                   flush=True)
             cfg = GRPOConfig(output_dir=f"runs/grpo_seed{seed}", seed=seed,
                              max_steps=s.steps_per_round, logging_steps=10,
-                             save_strategy="no", report_to=[], **s.to_trl_kwargs())
+                             save_strategy="no", report_to=[], bf16=on_cuda,
+                             **s.to_trl_kwargs())
             trainer = GRPOTrainer(model=model, reward_funcs=[make_trl_reward()],
                                   args=cfg, train_dataset=ds, processing_class=tok)
             trainer.train()
