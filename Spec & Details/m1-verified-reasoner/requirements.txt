@@ -1,0 +1,5 @@
+# Real runs only. The CPU mock (python run.py --mock) needs NONE of these.
+torch>=2.2
+transformers>=4.44
+datasets>=2.20
+accelerate>=0.33

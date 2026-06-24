@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verge"
+version = "0.1.0"
+description = "VERGE — a layered, verifier-bounded reasoning architecture (skeleton; L3 implemented)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "VERGE" }]
+
+# Core deps for the MOCK path: numpy only. The whole CPU mock + test suite installs
+# and runs clean with no GPU and no network model download.
+dependencies = [
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# What `pytest` needs — the green-on-CPU acceptance path.
+mock = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+
+# Heavy / GPU deps, isolated so the mock path never pulls them (verge-engineering.md §1).
+l3 = ["torch>=2.2", "transformers>=4.44", "datasets>=2.20", "accelerate>=0.33",
+      "trl>=0.9", "peft>=0.11"]
+infer = ["vllm>=0.5"]
+memory = ["faiss-cpu>=1.8"]
+world = ["dowhy>=0.11", "pyro-ppl>=1.9"]
+sandbox = ["wasmtime>=21.0"]
+track = ["wandb>=0.17"]
+# Everything (a single H100 box), for the full build.
+all = [
+  "verge[l3,infer,memory,world,sandbox,track,dev]",
+]
+
+[project.scripts]
+verge-l3 = "verge.l3_reasoner.run:main"
+verge-demo = "verge.orchestrator:run_demo"
+
+[tool.setuptools.packages.find]
+include = ["verge*"]
+exclude = ["tests*", "Spec & Details*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
