@@ -36,7 +36,17 @@ def main() -> int:
     ap.add_argument("--test-size", type=int, default=300)
     ap.add_argument("--steps-per-round", type=int, default=100)
     ap.add_argument("--outdir", default="runs/verge_l3")
+    ap.add_argument("--no-vllm", action="store_true",
+                    help="disable TRL's vLLM generation (use HF generate) — safer first run")
+    ap.add_argument("--smoke", action="store_true",
+                    help="tiny real-GPU shakeout: 0.5B, K=4, 1 round, 1 seed, small splits")
     args = ap.parse_args()
+
+    if args.smoke:
+        args.base = "Qwen/Qwen2.5-0.5B-Instruct"
+        args.k, args.rounds, args.seeds = 4, 1, [0]
+        args.train_size, args.test_size, args.steps_per_round = 200, 200, 20
+        args.no_vllm = True
 
     layer, frozen_test = _build(args)
     if layer is None:
@@ -92,7 +102,8 @@ def _build(args):
     if args.engine == "grpo":
         from verge.l3_reasoner.grpo import build_grpo_engine
         layer = build_grpo_engine(base_model=args.base, train=train, k=args.k,
-                                  steps_per_round=args.steps_per_round)
+                                  steps_per_round=args.steps_per_round,
+                                  use_vllm=not args.no_vllm)
         return layer, test
 
     # real expert-iteration (the original M1 engine on a real model)

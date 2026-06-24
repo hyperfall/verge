@@ -204,8 +204,10 @@ def build_grpo_mock_adapter(*, rounds: int = 4, k: int = 8, n_train: int = 400,
 
 
 def build_grpo_engine(*, base_model: str, train, k: int = 8, lr: float = 2e-6,
-                      steps_per_round: int = 100):
-    """Assemble the real (GPU) GRPO engine. Caller supplies train problems + frozen test."""
+                      steps_per_round: int = 100, use_vllm: bool = True):
+    """Assemble the real (GPU) GRPO engine. Caller supplies train problems + frozen test.
+    `use_vllm=False` falls back to TRL's HF generation — slower but no vLLM-server setup,
+    the safer first-run path."""
     settings = GRPOSettings(base_model=base_model, num_generations=k, lr=lr,
-                            steps_per_round=steps_per_round)
+                            steps_per_round=steps_per_round, use_vllm=use_vllm)
     return GRPOEngine(settings=settings, train=train)
