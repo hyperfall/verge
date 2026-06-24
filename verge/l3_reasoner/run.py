@@ -44,7 +44,8 @@ def main() -> int:
 
     if args.smoke:
         args.base = "Qwen/Qwen2.5-0.5B-Instruct"
-        args.k, args.rounds, args.seeds = 4, 1, [0]
+        # 3 seeds: harness enforces the §7 pre-registration guard (>=3) even in smoke
+        args.k, args.rounds, args.seeds = 4, 1, [0, 1, 2]
         args.train_size, args.test_size, args.steps_per_round = 200, 200, 20
         args.no_vllm = True
 
