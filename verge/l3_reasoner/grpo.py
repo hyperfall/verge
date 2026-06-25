@@ -50,6 +50,8 @@ class GRPOSettings:
     use_vllm: bool = True            # the throughput lever (verge[infer])
     vllm_mode: str = "colocate"      # single-GPU: vLLM shares the training GPU with the policy
     vllm_gpu_memory_utilization: float = 0.3  # vLLM's share; training keeps the rest of the GPU
+    vllm_enforce_eager: bool = True  # skip CUDA-graph capture: faster init + memory freeable
+    #                                  across seeds (captured graphs pin GPU mem gc can't free)
     per_device_train_batch_size: int = 8
     gradient_checkpointing: bool = False  # trade compute for memory (full-FT 7B needs it)
     optim: str = "adamw_torch"       # "paged_adamw_8bit" to full-FT 7B on ONE 80GB GPU
@@ -78,6 +80,7 @@ class GRPOSettings:
         if self.use_vllm:  # only meaningful with vLLM; names vary across TRL versions
             desired["vllm_mode"] = self.vllm_mode
             desired["vllm_gpu_memory_utilization"] = self.vllm_gpu_memory_utilization
+            desired["vllm_enforce_eager"] = self.vllm_enforce_eager
         from trl import GRPOConfig  # lazy
 
         accepted = set(inspect.signature(GRPOConfig.__init__).parameters)
@@ -98,6 +101,28 @@ def make_trl_reward(answer_key: str = "answer"):
 
     _reward.__name__ = "ring0_exact_match_reward"
     return _reward
+
+
+def _free_trainer(trainer) -> None:
+    """Best-effort release of a GRPOTrainer's colocated vLLM engine. vLLM holds ~24GB that
+    plain gc does NOT reclaim (in-process engine core + any CUDA graphs), so we explicitly
+    shut it down before dropping the trainer — otherwise it leaks into the next seed/round."""
+    import contextlib
+
+    vg = getattr(trainer, "vllm_generation", None)
+    llm = getattr(vg, "llm", None) if vg is not None else None
+    if llm is not None:
+        eng = getattr(llm, "llm_engine", None)
+        core = getattr(eng, "engine_core", None) if eng is not None else None
+        for obj in (core, eng, llm):
+            with contextlib.suppress(Exception):
+                if obj is not None and hasattr(obj, "shutdown"):
+                    obj.shutdown()
+    with contextlib.suppress(Exception):
+        from vllm.distributed.parallel_state import (
+            destroy_distributed_environment, destroy_model_parallel)
+        destroy_model_parallel()
+        destroy_distributed_environment()
 
 
 @dataclass
@@ -193,6 +218,7 @@ class GRPOEngine:
             # balloons during eval — vLLM colocate checks FREE (not live) GPU memory at init,
             # so without this it sees ~8 GB free next to a 14 GB model and refuses to start.
             if trainer is not None:
+                _free_trainer(trainer)
                 del trainer
             gc.collect()
             if on_cuda:
@@ -215,6 +241,7 @@ class GRPOEngine:
         # clean GPU. The harness loops seeds in one process; vLLM colocate holds ~24GB that
         # frame teardown alone does NOT reclaim (ref cycles), so force gc + empty_cache here.
         result = list(curve)
+        _free_trainer(trainer)
         del trainer, model
         gc.collect()
         if on_cuda:
