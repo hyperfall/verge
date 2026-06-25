@@ -48,8 +48,12 @@ class GRPOSettings:
     beta: float = 0.0                # no KL (DAPO)
     # generation backend + schedule
     use_vllm: bool = True            # the throughput lever (verge[infer])
+    vllm_mode: str = "colocate"      # single-GPU: vLLM shares the training GPU with the policy
+    vllm_gpu_memory_utilization: float = 0.3  # vLLM's share; training keeps the rest of the GPU
     per_device_train_batch_size: int = 8
     gradient_checkpointing: bool = False  # trade compute for memory (full-FT 7B needs it)
+    optim: str = "adamw_torch"       # "paged_adamw_8bit" to full-FT 7B on ONE 80GB GPU
+    load_in_bf16: bool = False       # load weights in bf16 (halves param memory; 7B/1-GPU)
     eval_batch_size: int = 32        # frozen-test eval batched (was 1-at-a-time)
     steps_per_round: int = 100       # GRPO steps between frozen-test measurements
     eval_rounds: int = 4
@@ -66,10 +70,14 @@ class GRPOSettings:
             "scale_rewards": self.scale_rewards,
             "beta": self.beta,
             "use_vllm": self.use_vllm,
+            "optim": self.optim,
             "per_device_train_batch_size": self.per_device_train_batch_size,
             # DAPO dynamic sampling surfaces under different names across versions:
             "mask_truncated_completions": True,
         }
+        if self.use_vllm:  # only meaningful with vLLM; names vary across TRL versions
+            desired["vllm_mode"] = self.vllm_mode
+            desired["vllm_gpu_memory_utilization"] = self.vllm_gpu_memory_utilization
         from trl import GRPOConfig  # lazy
 
         accepted = set(inspect.signature(GRPOConfig.__init__).parameters)
@@ -155,7 +163,8 @@ class GRPOEngine:
                 tok.padding_side = prev_side
             return correct / n
 
-        model = AutoModelForCausalLM.from_pretrained(s.base_model)
+        load_dtype = torch.bfloat16 if (s.load_in_bf16 and on_cuda) else None
+        model = AutoModelForCausalLM.from_pretrained(s.base_model, torch_dtype=load_dtype)
         if on_cuda:
             # Each rank owns one local GPU (cuda:LOCAL_RANK). Plain `python -m` → cuda:0.
             # Without this the pre-trainer baseline eval would pile every rank onto cuda:0;
@@ -243,14 +252,20 @@ def build_grpo_mock_adapter(*, rounds: int = 4, k: int = 8, n_train: int = 400,
 
 def build_grpo_engine(*, base_model: str, train, k: int = 8, lr: float = 2e-6,
                       steps_per_round: int = 100, use_vllm: bool = True,
-                      per_device_batch: int = 8, gradient_checkpointing: bool = False):
+                      per_device_batch: int = 8, gradient_checkpointing: bool = False,
+                      optim: str = "adamw_torch", load_in_bf16: bool = False,
+                      vllm_gpu_memory_utilization: float = 0.3):
     """Assemble the real (GPU) GRPO engine. Caller supplies train problems + frozen test.
     `use_vllm=False` falls back to TRL's HF generation — slower but no vLLM-server setup,
     the safer first-run path. `gradient_checkpointing` trades compute for memory (needed to
-    full-FT 7B). NOTE: under multi-GPU, `per_device_batch * num_processes` must be a
-    multiple of `k` (num_generations) — TRL requires the global batch divide the group."""
+    full-FT 7B). `optim='paged_adamw_8bit'` + `load_in_bf16=True` full-FT 7B on ONE 80GB GPU
+    (needs bitsandbytes). With vLLM colocate on one GPU, `vllm_gpu_memory_utilization` is
+    vLLM's share — keep it low (~0.3) so the policy + optimizer keep the rest. NOTE: under
+    multi-GPU, `per_device_batch * num_processes` must be a multiple of `k`."""
     settings = GRPOSettings(base_model=base_model, num_generations=k, lr=lr,
                             steps_per_round=steps_per_round, use_vllm=use_vllm,
                             per_device_train_batch_size=per_device_batch,
-                            gradient_checkpointing=gradient_checkpointing)
+                            gradient_checkpointing=gradient_checkpointing,
+                            optim=optim, load_in_bf16=load_in_bf16,
+                            vllm_gpu_memory_utilization=vllm_gpu_memory_utilization)
     return GRPOEngine(settings=settings, train=train)

@@ -43,14 +43,24 @@ def main() -> int:
     ap.add_argument("--scale", action="store_true",
                     help="§5.4 headroom run: 7B, K=16, 4 rounds, 3 seeds (multi-GPU full-FT "
                          "via `accelerate launch` + DeepSpeed ZeRO-2; see scripts/pod_setup.sh)")
+    ap.add_argument("--budget", action="store_true",
+                    help="single-A100 7B run: vLLM colocate + 8-bit Adam + bf16, reduced "
+                         "config (K=8, 3 rounds, 60 steps, 3 seeds). Plain `python -m`, no accelerate.")
+    ap.add_argument("--dryrun", action="store_true",
+                    help="after a preset, shrink to a ~$0.50 toolchain test (3 steps, tiny eval)")
     ap.add_argument("--per-device-batch", type=int, default=8,
                     help="per-GPU train batch; per_device*num_gpus must be a multiple of K")
     ap.add_argument("--grad-checkpointing", action="store_true",
                     help="trade compute for memory (required to full-FT 7B)")
+    ap.add_argument("--optim", default="adamw_torch",
+                    help="HF optim; 'paged_adamw_8bit' to fit full-FT 7B on one 80GB GPU")
+    ap.add_argument("--load-bf16", action="store_true", help="load weights in bf16")
+    ap.add_argument("--vllm-mem", type=float, default=0.3,
+                    help="vLLM colocate GPU memory share (training keeps the rest)")
     args = ap.parse_args()
 
-    if args.smoke and args.scale:
-        ap.error("--smoke and --scale are mutually exclusive")
+    if sum([args.smoke, args.scale, args.budget]) > 1:
+        ap.error("--smoke / --scale / --budget are mutually exclusive")
 
     if args.smoke:
         args.base = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -69,6 +79,24 @@ def main() -> int:
         args.train_size, args.test_size, args.steps_per_round = 800, 500, 150
         args.per_device_batch = 4   # 4 GPUs * 4 = 16 = K; adjust if num_processes differs
         args.grad_checkpointing = True
+
+    if args.budget:
+        # Single-A100 7B headroom run on a tight budget. vLLM colocate (fast generation) +
+        # 8-bit Adam + bf16 weights + grad-checkpointing fit full-FT 7B on ONE 80GB GPU.
+        # Launch with plain `python -m` (no accelerate). beta=0 already skips the ref model.
+        args.base = "Qwen/Qwen2.5-7B-Instruct"
+        args.k, args.rounds, args.seeds = 8, 3, [0, 1, 2]
+        args.train_size, args.test_size, args.steps_per_round = 400, 200, 60
+        args.per_device_batch = 8   # 1 GPU * 8, K=8 -> 8 % 8 == 0
+        args.grad_checkpointing = True
+        args.optim = "paged_adamw_8bit"
+        args.load_bf16 = True
+        # vLLM stays ON (don't set --no-vllm); --vllm-mem controls its GPU share.
+
+    if args.dryrun:
+        # Toolchain gate: prove vLLM + 8-bit Adam + 7B load and step for ~$0.50 before the
+        # real run. Keeps 3 seeds (the §7 guard) but makes each trivially short.
+        args.rounds, args.steps_per_round, args.test_size = 1, 3, 16
 
     layer, frozen_test = _build(args)
     if layer is None:
@@ -129,7 +157,9 @@ def _build(args):
                                   steps_per_round=args.steps_per_round,
                                   use_vllm=not args.no_vllm,
                                   per_device_batch=args.per_device_batch,
-                                  gradient_checkpointing=args.grad_checkpointing)
+                                  gradient_checkpointing=args.grad_checkpointing,
+                                  optim=args.optim, load_in_bf16=args.load_bf16,
+                                  vllm_gpu_memory_utilization=args.vllm_mem)
         return layer, test
 
     # real expert-iteration (the original M1 engine on a real model)
