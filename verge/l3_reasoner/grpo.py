@@ -210,7 +210,17 @@ class GRPOEngine:
             model = trainer.model
             mprint(f"[seed {seed}] round {_r}/{rounds} — post-train eval")
             curve.append(measure(model))
-        return curve
+
+        # Tear down this seed's trainer + vLLM engine + model so the NEXT seed starts on a
+        # clean GPU. The harness loops seeds in one process; vLLM colocate holds ~24GB that
+        # frame teardown alone does NOT reclaim (ref cycles), so force gc + empty_cache here.
+        result = list(curve)
+        del trainer, model
+        gc.collect()
+        if on_cuda:
+            torch.cuda.empty_cache()
+        _mem("after seed teardown")
+        return result
 
 
 @dataclass
