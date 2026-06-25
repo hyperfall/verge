@@ -25,8 +25,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mock", action="store_true", help="CPU simulator (no GPU/ML deps)")
-    ap.add_argument("--engine", choices=["expert_iteration", "grpo"],
+    ap.add_argument("--engine", choices=["expert_iteration", "grpo", "distill"],
                     default="expert_iteration")
+    ap.add_argument("--source", choices=["self", "teacher"], default="teacher",
+                    help="distill engine: trace source — 'self' (leashed control) | 'teacher' (escape)")
+    ap.add_argument("--teacher", default="",
+                    help="distill: path to a JSONL of verified teacher traces {id, solution}")
     ap.add_argument("--dataset", choices=["gsm8k", "math"], default="gsm8k")
     ap.add_argument("--base", default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--k", type=int, default=8, help="group size / samples per problem")
@@ -137,6 +141,11 @@ def _build(args):
             return build_grpo_mock_adapter(rounds=args.rounds, k=args.k,
                                            n_train=args.train_size, n_test=args.test_size,
                                            output_dir=args.outdir)
+        if args.engine == "distill":
+            from verge.l3_reasoner.distill import build_distill_mock_adapter
+            return build_distill_mock_adapter(rounds=args.rounds, source=args.source, k=args.k,
+                                              n_train=args.train_size, n_test=args.test_size,
+                                              output_dir=args.outdir)
         from verge.l3_reasoner.service import build_mock_adapter
         return build_mock_adapter(rounds=args.rounds, n_train=args.train_size,
                                   n_test=args.test_size, output_dir=args.outdir)
@@ -160,6 +169,16 @@ def _build(args):
                                   gradient_checkpointing=args.grad_checkpointing,
                                   optim=args.optim, load_in_bf16=args.load_bf16,
                                   vllm_gpu_memory_utilization=args.vllm_mem)
+        return layer, test
+
+    if args.engine == "distill":
+        from verge.l3_reasoner.distill import build_distill_engine
+        layer = build_distill_engine(base_model=args.base, train=train, source=args.source,
+                                     teacher_traces=args.teacher, k=args.k,
+                                     steps_per_round=args.steps_per_round,
+                                     per_device_batch=args.per_device_batch,
+                                     gradient_checkpointing=args.grad_checkpointing,
+                                     load_in_bf16=args.load_bf16, optim=args.optim)
         return layer, test
 
     # real expert-iteration (the original M1 engine on a real model)
