@@ -138,6 +138,12 @@ class GRPOEngine:
             return torch.autocast("cuda", dtype=torch.bfloat16) if on_cuda \
                 else contextlib.nullcontext()
 
+        def _mem(tag):
+            if on_cuda:
+                mprint(f"[mem] {tag}: alloc={torch.cuda.memory_allocated()/1e9:.1f} "
+                       f"reserved={torch.cuda.memory_reserved()/1e9:.1f} "
+                       f"free={torch.cuda.mem_get_info()[0]/1e9:.1f} GB")
+
         @torch.no_grad()
         def measure(model) -> float:
             model.eval()
@@ -165,15 +171,20 @@ class GRPOEngine:
             return correct / n
 
         load_dtype = torch.bfloat16 if (s.load_in_bf16 and on_cuda) else None
-        model = AutoModelForCausalLM.from_pretrained(s.base_model, torch_dtype=load_dtype)
+        try:  # transformers>=5 renamed torch_dtype -> dtype; ignoring it silently loads fp32
+            model = AutoModelForCausalLM.from_pretrained(s.base_model, dtype=load_dtype)
+        except TypeError:
+            model = AutoModelForCausalLM.from_pretrained(s.base_model, torch_dtype=load_dtype)
         if on_cuda:
             # Each rank owns one local GPU (cuda:LOCAL_RANK). Plain `python -m` → cuda:0.
             # Without this the pre-trainer baseline eval would pile every rank onto cuda:0;
             # TRL only places the model itself later, inside .train().
             torch.cuda.set_device(local_rank())
             model = model.to(f"cuda:{local_rank()}")
+        _mem("after model load")
         mprint(f"[seed {seed}] round 0/{rounds} — baseline eval")
         curve = [measure(model)]  # round 0 baseline, before any GRPO
+        _mem("after baseline eval")
 
         trainer = None
         for _r in range(1, rounds + 1):
@@ -186,6 +197,7 @@ class GRPOEngine:
             gc.collect()
             if on_cuda:
                 torch.cuda.empty_cache()
+            _mem("before trainer/vLLM init")
             cfg = GRPOConfig(output_dir=f"runs/grpo_seed{seed}", seed=seed,
                              max_steps=s.steps_per_round, logging_steps=10,
                              save_strategy="no", report_to=[], bf16=on_cuda,
