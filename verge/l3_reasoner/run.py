@@ -40,7 +40,13 @@ def main() -> int:
                     help="disable TRL's vLLM generation (use HF generate) — safer first run")
     ap.add_argument("--smoke", action="store_true",
                     help="tiny real-GPU shakeout: 0.5B, K=4, 1 round, 1 seed, small splits")
+    ap.add_argument("--scale", action="store_true",
+                    help="§5.4 headroom run: 7B, K=16, 4 rounds, 3 seeds (needs torch>=2.6 "
+                         "pod + vLLM; see scripts/pod_setup.sh)")
     args = ap.parse_args()
+
+    if args.smoke and args.scale:
+        ap.error("--smoke and --scale are mutually exclusive")
 
     if args.smoke:
         args.base = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -48,6 +54,14 @@ def main() -> int:
         args.k, args.rounds, args.seeds = 4, 1, [0, 1, 2]
         args.train_size, args.test_size, args.steps_per_round = 128, 128, 20
         args.no_vllm = True
+
+    if args.scale:
+        # The headroom config (spec §5.4): a bigger base + more search is the lever, not a
+        # cleverer objective. This preset clobbers k/rounds/seeds/sizes; to tune them, pass
+        # explicit flags instead of --scale. --dataset is left untouched (gsm8k or math).
+        args.base = "Qwen/Qwen2.5-7B-Instruct"
+        args.k, args.rounds, args.seeds = 16, 4, [0, 1, 2]
+        args.train_size, args.test_size, args.steps_per_round = 800, 500, 150
 
     layer, frozen_test = _build(args)
     if layer is None:
