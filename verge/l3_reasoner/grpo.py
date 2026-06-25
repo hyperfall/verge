@@ -170,11 +170,11 @@ class GRPOEngine:
                 tok.padding_side = prev_side
             return correct / n
 
-        load_dtype = torch.bfloat16 if (s.load_in_bf16 and on_cuda) else None
-        try:  # transformers>=5 renamed torch_dtype -> dtype; ignoring it silently loads fp32
-            model = AutoModelForCausalLM.from_pretrained(s.base_model, dtype=load_dtype)
-        except TypeError:
-            model = AutoModelForCausalLM.from_pretrained(s.base_model, torch_dtype=load_dtype)
+        model = AutoModelForCausalLM.from_pretrained(s.base_model)
+        if s.load_in_bf16 and on_cuda:
+            # Foolproof bf16: the from_pretrained dtype kwarg was renamed across transformers
+            # versions and silently ignored when wrong, leaving a 28GB fp32 7B. Convert directly.
+            model = model.bfloat16()
         if on_cuda:
             # Each rank owns one local GPU (cuda:LOCAL_RANK). Plain `python -m` → cuda:0.
             # Without this the pre-trainer baseline eval would pile every rank onto cuda:0;
