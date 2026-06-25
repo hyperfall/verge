@@ -41,8 +41,12 @@ def main() -> int:
     ap.add_argument("--smoke", action="store_true",
                     help="tiny real-GPU shakeout: 0.5B, K=4, 1 round, 1 seed, small splits")
     ap.add_argument("--scale", action="store_true",
-                    help="§5.4 headroom run: 7B, K=16, 4 rounds, 3 seeds (needs torch>=2.6 "
-                         "pod + vLLM; see scripts/pod_setup.sh)")
+                    help="§5.4 headroom run: 7B, K=16, 4 rounds, 3 seeds (multi-GPU full-FT "
+                         "via `accelerate launch` + DeepSpeed ZeRO-2; see scripts/pod_setup.sh)")
+    ap.add_argument("--per-device-batch", type=int, default=8,
+                    help="per-GPU train batch; per_device*num_gpus must be a multiple of K")
+    ap.add_argument("--grad-checkpointing", action="store_true",
+                    help="trade compute for memory (required to full-FT 7B)")
     args = ap.parse_args()
 
     if args.smoke and args.scale:
@@ -59,9 +63,12 @@ def main() -> int:
         # The headroom config (spec §5.4): a bigger base + more search is the lever, not a
         # cleverer objective. This preset clobbers k/rounds/seeds/sizes; to tune them, pass
         # explicit flags instead of --scale. --dataset is left untouched (gsm8k or math).
+        # Full-FT 7B → must run under `accelerate launch` (ZeRO-2) with grad checkpointing.
         args.base = "Qwen/Qwen2.5-7B-Instruct"
         args.k, args.rounds, args.seeds = 16, 4, [0, 1, 2]
         args.train_size, args.test_size, args.steps_per_round = 800, 500, 150
+        args.per_device_batch = 4   # 4 GPUs * 4 = 16 = K; adjust if num_processes differs
+        args.grad_checkpointing = True
 
     layer, frozen_test = _build(args)
     if layer is None:
@@ -81,14 +88,16 @@ def main() -> int:
 
     report = evaluate(layer, seeds=tuple(args.seeds), rounds=args.rounds,
                       frozen_test=frozen_test, ablations={}, preregister=preregister)
-    print(report.summary())
 
-    if args.mock:
-        _report_plateau(report, plateau_start=min(2, args.rounds))
-        print("\nNOTE: the mock validates the pipeline; it models generation, not the "
-              "verifier-reachable ceiling. The measured GSM8K result is FLAT from round 0 "
-              "(slope CI includes zero) — spec §5 / m1-verified-reasoner/RESULTS.md. A "
-              "positive slope needs headroom (MATH, 7B+, K>>4), not a cleverer objective.")
+    from verge.l3_reasoner._dist import is_main
+    if is_main():  # under multi-GPU, only rank 0 prints the report
+        print(report.summary())
+        if args.mock:
+            _report_plateau(report, plateau_start=min(2, args.rounds))
+            print("\nNOTE: the mock validates the pipeline; it models generation, not the "
+                  "verifier-reachable ceiling. The measured GSM8K result is FLAT from round 0 "
+                  "(slope CI includes zero) — spec §5 / m1-verified-reasoner/RESULTS.md. A "
+                  "positive slope needs headroom (MATH, 7B+, K>>4), not a cleverer objective.")
     return 0
 
 
@@ -118,7 +127,9 @@ def _build(args):
         from verge.l3_reasoner.grpo import build_grpo_engine
         layer = build_grpo_engine(base_model=args.base, train=train, k=args.k,
                                   steps_per_round=args.steps_per_round,
-                                  use_vllm=not args.no_vllm)
+                                  use_vllm=not args.no_vllm,
+                                  per_device_batch=args.per_device_batch,
+                                  gradient_checkpointing=args.grad_checkpointing)
         return layer, test
 
     # real expert-iteration (the original M1 engine on a real model)

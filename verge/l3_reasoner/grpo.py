@@ -49,6 +49,7 @@ class GRPOSettings:
     # generation backend + schedule
     use_vllm: bool = True            # the throughput lever (verge[infer])
     per_device_train_batch_size: int = 8
+    gradient_checkpointing: bool = False  # trade compute for memory (full-FT 7B needs it)
     eval_batch_size: int = 32        # frozen-test eval batched (was 1-at-a-time)
     steps_per_round: int = 100       # GRPO steps between frozen-test measurements
     eval_rounds: int = 4
@@ -108,6 +109,7 @@ class GRPOEngine:
         from trl import GRPOConfig, GRPOTrainer
 
         from model import _build_prompt  # m1, unedited (locks the #### format)
+        from verge.l3_reasoner._dist import local_rank, mprint
         from verge.ring0 import verify, Problem
 
         s = self.settings
@@ -148,30 +150,34 @@ class GRPOEngine:
                         text = tok.decode(g, skip_special_tokens=True)
                         correct += int(verify(Problem(p.id, p.prompt, p.answer), text))
                     done = min(start + bs, n)
-                    print(f"  [eval] {done}/{n}  running acc={correct / done:.3f}", flush=True)
+                    mprint(f"  [eval] {done}/{n}  running acc={correct / done:.3f}")
             finally:
                 tok.padding_side = prev_side
             return correct / n
 
         model = AutoModelForCausalLM.from_pretrained(s.base_model)
-        if torch.cuda.is_available():
-            model = model.to("cuda")  # else baseline measure() runs on CPU (TRL only
-            #                            moves the model to GPU later, inside .train())
-        print(f"[seed {seed}] round 0/{rounds} — baseline eval", flush=True)
+        if on_cuda:
+            # Each rank owns one local GPU (cuda:LOCAL_RANK). Plain `python -m` → cuda:0.
+            # Without this the pre-trainer baseline eval would pile every rank onto cuda:0;
+            # TRL only places the model itself later, inside .train().
+            torch.cuda.set_device(local_rank())
+            model = model.to(f"cuda:{local_rank()}")
+        mprint(f"[seed {seed}] round 0/{rounds} — baseline eval")
         curve = [measure(model)]  # round 0 baseline, before any GRPO
 
         for _r in range(1, rounds + 1):
-            print(f"[seed {seed}] round {_r}/{rounds} — GRPO {s.steps_per_round} steps",
-                  flush=True)
+            mprint(f"[seed {seed}] round {_r}/{rounds} — GRPO {s.steps_per_round} steps")
             cfg = GRPOConfig(output_dir=f"runs/grpo_seed{seed}", seed=seed,
                              max_steps=s.steps_per_round, logging_steps=10,
                              save_strategy="no", report_to=[], bf16=on_cuda,
+                             gradient_checkpointing=s.gradient_checkpointing,
+                             gradient_checkpointing_kwargs={"use_reentrant": False},
                              **s.to_trl_kwargs())
             trainer = GRPOTrainer(model=model, reward_funcs=[make_trl_reward()],
                                   args=cfg, train_dataset=ds, processing_class=tok)
             trainer.train()
             model = trainer.model
-            print(f"[seed {seed}] round {_r}/{rounds} — post-train eval", flush=True)
+            mprint(f"[seed {seed}] round {_r}/{rounds} — post-train eval")
             curve.append(measure(model))
         return curve
 
@@ -236,10 +242,15 @@ def build_grpo_mock_adapter(*, rounds: int = 4, k: int = 8, n_train: int = 400,
 
 
 def build_grpo_engine(*, base_model: str, train, k: int = 8, lr: float = 2e-6,
-                      steps_per_round: int = 100, use_vllm: bool = True):
+                      steps_per_round: int = 100, use_vllm: bool = True,
+                      per_device_batch: int = 8, gradient_checkpointing: bool = False):
     """Assemble the real (GPU) GRPO engine. Caller supplies train problems + frozen test.
     `use_vllm=False` falls back to TRL's HF generation — slower but no vLLM-server setup,
-    the safer first-run path."""
+    the safer first-run path. `gradient_checkpointing` trades compute for memory (needed to
+    full-FT 7B). NOTE: under multi-GPU, `per_device_batch * num_processes` must be a
+    multiple of `k` (num_generations) — TRL requires the global batch divide the group."""
     settings = GRPOSettings(base_model=base_model, num_generations=k, lr=lr,
-                            steps_per_round=steps_per_round, use_vllm=use_vllm)
+                            steps_per_round=steps_per_round, use_vllm=use_vllm,
+                            per_device_train_batch_size=per_device_batch,
+                            gradient_checkpointing=gradient_checkpointing)
     return GRPOEngine(settings=settings, train=train)

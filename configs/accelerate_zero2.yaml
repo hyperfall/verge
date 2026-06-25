@@ -1,0 +1,31 @@
+# DeepSpeed ZeRO-2 config for the multi-GPU full-FT 7B headroom run (--scale).
+#
+# ZeRO-2 (NOT ZeRO-3) on purpose: it shards optimizer states + gradients but keeps a full
+# parameter replica on every GPU. That is what lets the harness's custom measure() call
+# model.generate() on each rank WITHOUT param-gathering. ZeRO-3 would shard params and the
+# eval would need DeepSpeed GatheredParameters plumbing we deliberately avoided.
+#
+# Launch (set --num_processes to your GPU count; keep per_device*num_processes a multiple of K=16):
+#   accelerate launch --config_file configs/accelerate_zero2.yaml --num_processes 4 \
+#       -m verge.l3_reasoner.run --engine grpo --scale --dataset gsm8k --no-vllm
+#
+# Memory (7B, ZeRO-2, bf16): ~14 GB params (replicated) + ~7 GB grads + optimizer/N per GPU.
+# 4x 80 GB is comfortable; 2x 80 GB is tight (raise N or add offload_optimizer_device: cpu).
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+deepspeed_config:
+  zero_stage: 2
+  gradient_accumulation_steps: 1
+  gradient_clipping: 1.0
+  zero3_init_flag: false
+  offload_optimizer_device: none
+  offload_param_device: none
+mixed_precision: bf16
+downcast_bf16: 'no'
+machine_rank: 0
+num_machines: 1
+num_processes: 4          # OVERRIDE with --num_processes to match the pod's GPU count
+rdzv_backend: static
+same_network: true
+use_cpu: false
+debug: false

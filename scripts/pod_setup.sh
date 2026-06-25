@@ -34,14 +34,15 @@ avail_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
 echo "root free: ${avail_gb} GB"
 [ "${avail_gb:-0}" -ge 30 ] || die "only ${avail_gb} GB free; 7B + CUDA wheels need ~30 GB. Use a bigger volume or set HF_HOME to one."
 
-say "3/5  install project deps (let pip resolve trl/transformers/vllm against THIS torch)"
+say "3/5  install project deps + DeepSpeed (let pip resolve trl/transformers against THIS torch)"
 # Do NOT pin torch here — the whole point of a clean image is that its torch is already right.
-# We install [l3,infer]; if the resolver tries to *replace* torch, that's the signal the
-# image is wrong — stop and pick a better template rather than fighting it.
+# We install [l3] (NOT [infer]: vLLM under multi-GPU DeepSpeed GRPO is a separate, harder
+# integration — the --scale run uses HF generate / --no-vllm). DeepSpeed is needed for ZeRO.
+# If the resolver tries to *replace* torch, that's the signal the image is wrong — stop.
 TORCH_BEFORE=$(python -c "import torch; print(torch.__version__)")
-pip install --no-cache-dir -e ".[l3,infer]"
+pip install --no-cache-dir -e ".[l3]" deepspeed
 TORCH_AFTER=$(python -c "import torch; print(torch.__version__)")
-[ "$TORCH_BEFORE" = "$TORCH_AFTER" ] || die "pip changed torch ($TORCH_BEFORE -> $TORCH_AFTER) — the image's torch was incompatible with current trl/vllm. Pick a template matched to the deps, or pin trl/transformers to torch $TORCH_BEFORE's era."
+[ "$TORCH_BEFORE" = "$TORCH_AFTER" ] || die "pip changed torch ($TORCH_BEFORE -> $TORCH_AFTER) — the image's torch was incompatible with current trl/deepspeed. Pick a template matched to the deps, or pin trl/transformers to torch $TORCH_BEFORE's era."
 
 say "4/5  import-check the bridge (no torchaudio / FSDPModule / sampler traps)"
 python - <<'PY' || die "bridge import failed — paste the traceback. Known traps: transformers 5.x imports torchaudio (cu mismatch); trl 0.16+ needs torch>=2.6; transformers 4.57 changed _get_train_sampler signature."
@@ -55,24 +56,35 @@ except Exception as e:
     print(f"vllm NOT importable ({type(e).__name__}) — run with --no-vllm; HF-generate still works, just slower.")
 PY
 
-say "5/5  GPU smoke (0.5B, 3 seeds) — proves the loop before spending 7B hours"
+say "5/5  single-GPU smoke (0.5B, 3 seeds) — proves the loop + pre-downloads weights/data"
 python -m verge.l3_reasoner.run --engine grpo --smoke
 
-cat <<'NEXT'
+NGPU=$(python -c "import torch; print(torch.cuda.device_count())")
+echo "visible GPUs: ${NGPU}"
 
-=== setup OK ===
-The 0.5B smoke proved the loop end-to-end on this pod. For the §5.4 headroom run:
+cat <<NEXT
 
-  # vLLM path (fast generation) — only if step 4 said "vllm ... importable":
-  python -m verge.l3_reasoner.run --engine grpo --scale --dataset gsm8k
+=== setup OK (${NGPU} GPUs visible) ===
+The single-GPU 0.5B smoke proved the loop. Next, validate the MULTI-GPU plumbing cheaply
+(0.5B across all GPUs via DeepSpeed ZeRO-2) BEFORE spending 7B hours:
 
-  # safe fallback if vLLM/trl are mismatched (trl historically caps at vLLM 0.19):
-  python -m verge.l3_reasoner.run --engine grpo --scale --dataset gsm8k --no-vllm
+  accelerate launch --config_file configs/accelerate_zero2.yaml --num_processes ${NGPU} \\
+      -m verge.l3_reasoner.run --engine grpo --smoke
+
+If that prints ONE clean slope+CI report (not ${NGPU} copies), rank-gating + ZeRO work.
+Then the real §5.4 headroom run (full-FT 7B):
+
+  accelerate launch --config_file configs/accelerate_zero2.yaml --num_processes ${NGPU} \\
+      -m verge.l3_reasoner.run --engine grpo --scale --dataset gsm8k --no-vllm
 
 Notes:
-  - --scale = 7B, K=16, 4 rounds, 3 seeds, 800/500 splits, 150 steps/round.
-  - --dataset math runs the NUMERIC SLICE only (the EXACT verifier's reach). General MATH
-    (fractions/surds/symbolic) needs the sympy MathEquivalenceRung — not yet built.
-  - With torch>=2.6 + trl>=0.16, GRPOSettings' DAPO knobs (epsilon_high clip-higher,
-    scale_rewards, beta=0) now actually take effect (on trl 0.15 they were filtered out).
+  - --scale = 7B, K=16, 4 rounds, 3 seeds, 800/500 splits, 150 steps/round, grad-checkpointing.
+  - Keep (per_device_batch * num_processes) a multiple of K=16. --scale sets per_device=4
+    (good for 4 GPUs). For ${NGPU} GPUs, pass e.g. --per-device-batch \$((16/${NGPU})) if 16%${NGPU}==0.
+  - ZeRO-2 keeps a full param replica per GPU so eval generation works; 4x80GB comfortable,
+    2x80GB tight (add offload_optimizer_device: cpu to the yaml, or use more GPUs).
+  - --dataset math = NUMERIC SLICE only (the EXACT verifier's reach); general MATH needs the
+    sympy MathEquivalenceRung (not yet built).
+  - vLLM is intentionally NOT installed: vLLM + multi-GPU + DeepSpeed GRPO is a separate
+    integration. --no-vllm (HF generate) is correct for this run.
 NEXT
