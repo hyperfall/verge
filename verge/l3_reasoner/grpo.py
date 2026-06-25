@@ -111,6 +111,7 @@ class GRPOEngine:
     def run_seed(self, seed: int, *, rounds: int, frozen_test) -> list[float]:
         # All heavy imports are lazy so this module is import-clean on CPU.
         import contextlib
+        import gc
         import torch  # noqa: F401
         from datasets import Dataset
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -174,8 +175,17 @@ class GRPOEngine:
         mprint(f"[seed {seed}] round 0/{rounds} — baseline eval")
         curve = [measure(model)]  # round 0 baseline, before any GRPO
 
+        trainer = None
         for _r in range(1, rounds + 1):
             mprint(f"[seed {seed}] round {_r}/{rounds} — GRPO {s.steps_per_round} steps")
+            # Reclaim the prior round's trainer/vLLM AND the reserved cache that HF generation
+            # balloons during eval — vLLM colocate checks FREE (not live) GPU memory at init,
+            # so without this it sees ~8 GB free next to a 14 GB model and refuses to start.
+            if trainer is not None:
+                del trainer
+            gc.collect()
+            if on_cuda:
+                torch.cuda.empty_cache()
             cfg = GRPOConfig(output_dir=f"runs/grpo_seed{seed}", seed=seed,
                              max_steps=s.steps_per_round, logging_steps=10,
                              save_strategy="no", report_to=[], bf16=on_cuda,
