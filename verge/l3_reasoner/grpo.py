@@ -104,11 +104,15 @@ def make_trl_reward(answer_key: str = "answer"):
 
 
 def _free_trainer(trainer) -> None:
-    """Best-effort release of a GRPOTrainer's colocated vLLM engine. vLLM holds ~24GB that
-    plain gc does NOT reclaim (in-process engine core + any CUDA graphs), so we explicitly
-    shut it down before dropping the trainer — otherwise it leaks into the next seed/round."""
+    """Best-effort full release of a GRPOTrainer so NOTHING leaks into the next seed/round.
+    Two distinct leaks, two distinct fixes:
+      1. the colocated vLLM engine (~24GB) — in-process core + CUDA graphs gc won't reclaim;
+      2. the policy model + optimizer (~15GB) — accelerate keeps a GLOBAL (singleton) ref to
+         the *prepared* model, so plain `del model` can't free it; without (2), each seed's
+         model stacks (15 -> 30 -> 46 GB) until vLLM init OOMs a later seed."""
     import contextlib
 
+    # (1) shut down vLLM
     vg = getattr(trainer, "vllm_generation", None)
     llm = getattr(vg, "llm", None) if vg is not None else None
     if llm is not None:
@@ -123,6 +127,15 @@ def _free_trainer(trainer) -> None:
             destroy_distributed_environment, destroy_model_parallel)
         destroy_model_parallel()
         destroy_distributed_environment()
+
+    # (2) make accelerate drop its global refs to the model + optimizer, then null the
+    # trainer's own strong refs so gc can actually reclaim them.
+    with contextlib.suppress(Exception):
+        trainer.accelerator.free_memory()
+    for attr in ("optimizer", "lr_scheduler", "model_wrapped", "model", "ref_model",
+                 "vllm_generation"):
+        with contextlib.suppress(Exception):
+            setattr(trainer, attr, None)
 
 
 @dataclass
