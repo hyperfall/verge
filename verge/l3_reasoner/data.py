@@ -78,21 +78,29 @@ def load_math(train_size: int = 1000, test_size: int = 500, *,
 
     from verge.ring0 import normalize_number  # numeric-checkability probe
 
+    # NOTE: hendrycks/competition_math was removed from the Hub; qwedsacf mirror ships only
+    # a `train` split, so we carve a disjoint held-out test from its tail when needed.
     ds = load_dataset("qwedsacf/competition_math")
 
-    def take(split, n, pre):
+    def numeric_pairs(split, want):
         out = []
-        for i, r in enumerate(split):
+        for r in split:
             ans = _extract_boxed(r.get("solution", "")) or ""
             if numeric_only and normalize_number(ans) is None:
                 continue
-            out.append(Problem(id=f"{pre}{len(out)}", prompt=r["problem"], answer=ans))
-            if len(out) >= n:
+            out.append((r["problem"], ans))
+            if len(out) >= want:
                 break
         return out
 
-    train = take(ds["train"], train_size, "tr")
-    test = take(ds["test"], test_size, "te")
+    if "test" in ds:
+        tr, te = numeric_pairs(ds["train"], train_size), numeric_pairs(ds["test"], test_size)
+    else:  # single-split mirror — disjoint train/test from one stream (train first, test next)
+        pairs = numeric_pairs(ds["train"], train_size + test_size)
+        tr, te = pairs[:train_size], pairs[train_size:train_size + test_size]
+
+    train = [Problem(id=f"tr{i}", prompt=p, answer=a) for i, (p, a) in enumerate(tr)]
+    test = [Problem(id=f"te{i}", prompt=p, answer=a) for i, (p, a) in enumerate(te)]
     if contamination_check:
         _check(train, test)
     return train, test
