@@ -68,7 +68,7 @@ def load_gsm8k(train_size: int = 1000, test_size: int = 500, contamination_check
 
 def load_math(train_size: int = 1000, test_size: int = 500, *,
               numeric_only: bool = True, contamination_check: bool = True):
-    """Load MATH (`hendrycks/competition_math`) into Problems with boxed answers.
+    """Load MATH (`qwedsacf/competition_math`) into Problems with boxed answers.
 
     `numeric_only=True` keeps only problems whose boxed answer the EXACT verifier can
     check today (so the existing Ring-0 verifier stays the only trusted signal). Set it
@@ -78,7 +78,7 @@ def load_math(train_size: int = 1000, test_size: int = 500, *,
 
     from verge.ring0 import normalize_number  # numeric-checkability probe
 
-    ds = load_dataset("hendrycks/competition_math")
+    ds = load_dataset("qwedsacf/competition_math")
 
     def take(split, n, pre):
         out = []
